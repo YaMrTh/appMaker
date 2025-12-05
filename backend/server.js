@@ -1,875 +1,1039 @@
-// web/app.js
+// backend/server.js
 
-// ------------- Basic DOM helpers -------------
+const express = require('express');
+const Database = require('better-sqlite3');
+const path = require('path');
 
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+const app = express();
 
-function createElem(tag, className, text) {
-  const el = document.createElement(tag);
-  if (className) el.className = className;
-  if (text != null) el.textContent = text;
-  return el;
-}
+// --- DB setup ---------------------------------------------------------
 
-// ------------- Global state -------------
+const dbPath = path.join(__dirname, '..', 'data', 'app.db');
+const db = new Database(dbPath);
+db.pragma('foreign_keys = ON');
 
-const state = {
-  tags: [],
-  currentTagId: null,
-  currentSubTagId: null,
-  currentSentence: null, // { id, tokens, japaneseSentence, ... }
-
-  lists: {
-    vocabulary: { page: 1, pageSize: 20, totalPages: 1 },
-    templates: { page: 1, pageSize: 20, totalPages: 1 },
-    sentenceLibrary: { page: 1, pageSize: 20, totalPages: 1 },
-  },
-};
-
-// ------------- Sidebar & layout -------------
-
-const navItems = $$('.nav__item');
-const sections = $$('.page-section');
-const sidebar = $('#sidebar');
-const overlay = $('#overlay');
-const menuToggle = $('#menuToggle');
-
-navItems.forEach((item) => {
-  item.addEventListener('click', (e) => {
-    e.preventDefault();
-    const target = item.dataset.target;
-    sections.forEach((section) => {
-      section.classList.toggle('hidden', section.id !== target);
-    });
-    navItems.forEach((link) =>
-      link.classList.toggle('active', link === item)
+function initSchema() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS vocabulary (
+      id INTEGER PRIMARY KEY,
+      kanji TEXT,
+      furigana TEXT,
+      romaji TEXT,
+      meaning TEXT,
+      part_of_speech TEXT,
+      topic TEXT,
+      subtopic TEXT,
+      politeness_level TEXT,
+      jlpt_level TEXT,
+      difficulty TEXT,
+      notes TEXT,
+      created_at DATETIME,
+      updated_at DATETIME
     );
 
-    sidebar.classList.remove('sidebar--open');
-    overlay.classList.remove('overlay--visible');
-
-    if (target === 'settings') {
-      loadSettingsDataOnce();
-    }
-  });
-});
-
-menuToggle.addEventListener('click', () => {
-  sidebar.classList.toggle('sidebar--open');
-  overlay.classList.toggle('overlay--visible');
-});
-
-overlay.addEventListener('click', () => {
-  sidebar.classList.remove('sidebar--open');
-  overlay.classList.remove('overlay--visible');
-});
-
-// ------------- Sentence generator -------------
-
-const tagSelect = $('#tagSelect');
-const subTagSelect = $('#subTagSelect');
-const politenessSelect = $('#politenessSelect');
-const difficultySelect = $('#difficultySelect');
-const jlptSelect = $('#jlptSelect');
-const generateButton = $('#generateButton');
-const generatedList = $('#generatedList');
-const generatedEmptyState = $('#generatedEmptyState');
-const sentenceDisplay = $('#sentenceDisplay');
-const favoriteButton = $('#favoriteButton');
-const rollButton = $('#rollButton');
-const generatedHint = $('#generatedHint');
-
-async function apiGet(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`GET ${url} failed: ${res.status}`);
-  return res.json();
-}
-
-async function apiPost(url, body) {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    const msg = data && data.error ? data.error : `POST ${url} failed`;
-    throw new Error(msg);
-  }
-  return data;
-}
-
-// Load tags and fill selects
-async function loadTags() {
-  try {
-    const { data } = await apiGet('/api/tags');
-    state.tags = data || [];
-
-    // top-level = parent_tag_id null
-    const topLevel = state.tags.filter((t) => t.parent_tag_id == null);
-
-    tagSelect.innerHTML = '<option value="">Select tag</option>';
-    topLevel.forEach((tag) => {
-      const opt = createElem('option', null, tag.name);
-      opt.value = String(tag.id);
-      tagSelect.appendChild(opt);
-    });
-
-    subTagSelect.innerHTML = '<option value="">Select sub tag</option>';
-    subTagSelect.disabled = true;
-  } catch (err) {
-    console.error(err);
-    tagSelect.innerHTML =
-      '<option value="">Error loading tags (check console)</option>';
-  }
-}
-
-function updateSubTagSelect(parentId) {
-  const parentIdNum = parentId ? Number(parentId) : null;
-  const children = state.tags.filter(
-    (t) => t.parent_tag_id != null && Number(t.parent_tag_id) === parentIdNum
-  );
-
-  subTagSelect.innerHTML = '<option value="">Select sub tag</option>';
-  if (!parentIdNum || children.length === 0) {
-    subTagSelect.disabled = true;
-    return;
-  }
-
-  children.forEach((tag) => {
-    const opt = createElem('option', null, tag.name);
-    opt.value = String(tag.id);
-    subTagSelect.appendChild(opt);
-  });
-  subTagSelect.disabled = false;
-}
-
-tagSelect.addEventListener('change', () => {
-  state.currentTagId = tagSelect.value || null;
-  state.currentSubTagId = null;
-  subTagSelect.value = '';
-  updateSubTagSelect(state.currentTagId);
-});
-
-subTagSelect.addEventListener('change', () => {
-  state.currentSubTagId = subTagSelect.value || null;
-});
-
-// Render sentence as clickable words (each token is fixed for now)
-function renderSentenceTokens(tokens) {
-  sentenceDisplay.innerHTML = '';
-  if (!tokens || tokens.length === 0) {
-    const span = createElem('span', 'generated__hint', 'No sentence selected.');
-    sentenceDisplay.appendChild(span);
-    return;
-  }
-
-  tokens.forEach((token) => {
-    const wrapper = createElem('div', 'word');
-    const button = createElem('button', 'word__button', token.display || '');
-    button.type = 'button';
-    wrapper.appendChild(button);
-    sentenceDisplay.appendChild(wrapper);
-  });
-}
-
-function addSentenceToHistoryList(sentenceData) {
-  // Remove empty state if present
-  if (generatedEmptyState) {
-    generatedEmptyState.remove();
-  }
-
-  const item = createElem('li', 'generated__item');
-  const textSpan = createElem('span', 'generated__text', sentenceData.japaneseSentence);
-
-  const useBtn = createElem(
-    'button',
-    'button button--ghost generated__button',
-    'Use'
-  );
-  useBtn.type = 'button';
-  useBtn.addEventListener('click', () => {
-    state.currentSentence = sentenceData;
-    renderSentenceTokens(sentenceData.tokens);
-    updateFavoriteButton();
-    sentenceDisplay.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  });
-
-  item.appendChild(textSpan);
-  item.appendChild(useBtn);
-  generatedList.prepend(item); // newest on top
-}
-
-function updateFavoriteButton() {
-  const s = state.currentSentence;
-  const isFav = s && s.is_favorite;
-  favoriteButton.setAttribute('aria-pressed', isFav ? 'true' : 'false');
-  favoriteButton.classList.toggle('button--favorite', !!isFav);
-}
-
-// Generate sentence
-generateButton.addEventListener('click', async () => {
-  const baseTagId = state.currentSubTagId || state.currentTagId;
-  if (!baseTagId) {
-    alert('Please select at least a Tag.');
-    return;
-  }
-
-  const body = {
-    tagId: Number(baseTagId),
-    difficulty: difficultySelect.value || null,
-    jlptLevel: jlptSelect.value || null,
-    politenessLevel: politenessSelect.value || null,
-    displayField: 'furigana',
-  };
-
-  generateButton.disabled = true;
-  generateButton.textContent = 'Generating...';
-
-  try {
-    const data = await apiPost('/api/generate', body);
-    const extended = { ...data, is_favorite: 0 }; // backend default is 0
-    state.currentSentence = extended;
-    renderSentenceTokens(extended.tokens);
-    addSentenceToHistoryList(extended);
-    updateFavoriteButton();
-    generatedHint.textContent = 'Sentences you generate will appear here.';
-  } catch (err) {
-    console.error(err);
-    alert(err.message);
-  } finally {
-    generateButton.disabled = false;
-    generateButton.textContent = 'Generate';
-  }
-});
-
-// Roll = generate another sentence using the same filters & last tag
-rollButton.addEventListener('click', async () => {
-  const baseTagId = state.currentSubTagId || state.currentTagId;
-  if (!baseTagId) {
-    alert('Pick a Tag before rolling.');
-    return;
-  }
-  try {
-    const data = await apiPost('/api/generate', {
-      tagId: Number(baseTagId),
-      difficulty: difficultySelect.value || null,
-      jlptLevel: jlptSelect.value || null,
-      politenessLevel: politenessSelect.value || null,
-      displayField: 'furigana',
-    });
-    const extended = { ...data, is_favorite: 0 };
-    state.currentSentence = extended;
-    renderSentenceTokens(extended.tokens);
-    addSentenceToHistoryList(extended);
-    updateFavoriteButton();
-  } catch (err) {
-    console.error(err);
-    alert(err.message);
-  }
-});
-
-// Favorite toggle
-favoriteButton.addEventListener('click', async () => {
-  const sentence = state.currentSentence;
-  if (!sentence || !sentence.id) return;
-
-  const newFav = !sentence.is_favorite;
-
-  try {
-    await apiPost(`/api/generated-sentences/${sentence.id}/favorite`, {
-      isFavorite: newFav,
-    });
-    sentence.is_favorite = newFav ? 1 : 0;
-    updateFavoriteButton();
-  } catch (err) {
-    console.error(err);
-    alert(err.message);
-  }
-});
-
-// ------------- Settings: shared helpers -------------
-
-let settingsLoaded = false;
-
-function ensurePositiveInt(value, fallback) {
-  const n = Number(value);
-  return Number.isInteger(n) && n > 0 ? n : fallback;
-}
-
-function openFullList(tileId) {
-  const url = new URL(window.location.href);
-  url.searchParams.set('fullTile', tileId);
-  url.hash = tileId;
-  window.open(url.toString(), '_blank');
-}
-
-$$('.pagination__full').forEach((btn) => {
-  btn.addEventListener('click', () => openFullList(btn.dataset.tile));
-});
-
-// ------------- Settings: Vocabulary -------------
-
-const vocabTopicFilter = $('#vocabTopicFilter');
-const vocabSubtopicFilter = $('#vocabSubtopicFilter');
-const vocabPolitenessFilter = $('#vocabPolitenessFilter');
-const vocabJlptFilter = $('#vocabJlptFilter');
-const vocabDifficultyFilter = $('#vocabDifficultyFilter');
-const vocabTableBody = $('#vocabTableBody');
-const vocabPaginationInfo = $('#vocabPaginationInfo');
-const vocabPaginationPage = $('#vocabPaginationPage');
-
-async function loadVocabularyPage() {
-  const listState = state.lists.vocabulary;
-  const page = ensurePositiveInt(listState.page, 1);
-  const pageSize = listState.pageSize;
-
-  const params = new URLSearchParams();
-  params.set('limit', pageSize);
-  params.set('offset', (page - 1) * pageSize);
-
-  if (vocabTopicFilter.value) params.set('topic', vocabTopicFilter.value);
-  if (vocabSubtopicFilter.value)
-    params.set('subtopic', vocabSubtopicFilter.value);
-  if (vocabPolitenessFilter.value)
-    params.set('politeness', vocabPolitenessFilter.value);
-  if (vocabJlptFilter.value) params.set('jlpt', vocabJlptFilter.value);
-  if (vocabDifficultyFilter.value)
-    params.set('difficulty', vocabDifficultyFilter.value);
-
-  try {
-    const { data, total } = await apiGet(`/api/vocabulary?${params.toString()}`);
-    vocabTableBody.innerHTML = '';
-
-    if (!data || data.length === 0) {
-      const row = createElem('div', 'table__row');
-      const cell = createElem(
-        'div',
-        'table__cell',
-        'No vocabulary found for current filters.'
-      );
-      cell.style.gridColumn = '1 / -1';
-      row.appendChild(cell);
-      vocabTableBody.appendChild(row);
-    } else {
-      data.forEach((row) => {
-        const tr = createElem('div', 'table__row');
-        const c0 = createElem('div', 'table__cell');
-        const checkbox = createElem('input');
-        checkbox.type = 'checkbox';
-        checkbox.disabled = true;
-        c0.appendChild(checkbox);
-
-        const wordText =
-          row.furigana || row.kanji || row.romaji || row.meaning || '(empty)';
-        const c1 = createElem('div', 'table__cell', wordText);
-        const c2 = createElem(
-          'div',
-          'table__cell',
-          `${row.topic || '-'} / ${row.subtopic || '-'}`
-        );
-        const c3 = createElem('div', 'table__cell', row.difficulty || '-');
-        const c4 = createElem('div', 'table__cell', row.updated_at || '-');
-
-        tr.appendChild(c0);
-        tr.appendChild(c1);
-        tr.appendChild(c2);
-        tr.appendChild(c3);
-        tr.appendChild(c4);
-
-        vocabTableBody.appendChild(tr);
-      });
-    }
-
-    const totalPages = Math.max(1, Math.ceil(total / pageSize));
-    listState.totalPages = totalPages;
-    listState.page = Math.min(page, totalPages);
-
-    vocabPaginationInfo.textContent = `Total ${total} vocab item(s) – page size ${pageSize}`;
-    vocabPaginationPage.textContent = `${listState.page} / ${totalPages}`;
-  } catch (err) {
-    console.error(err);
-    vocabPaginationInfo.textContent = 'Error loading vocabulary.';
-  }
-}
-
-$$('.pagination__button[data-tile="vocabulary"]').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const dir = btn.dataset.dir;
-    const listState = state.lists.vocabulary;
-    if (dir === 'prev') {
-      listState.page = Math.max(1, listState.page - 1);
-    } else if (dir === 'next') {
-      listState.page = Math.min(listState.totalPages, listState.page + 1);
-    }
-    loadVocabularyPage();
-  });
-});
-
-[
-  vocabTopicFilter,
-  vocabSubtopicFilter,
-  vocabPolitenessFilter,
-  vocabJlptFilter,
-  vocabDifficultyFilter,
-].forEach((el) =>
-  el.addEventListener('change', () => {
-    state.lists.vocabulary.page = 1;
-    loadVocabularyPage();
-  })
-);
-
-// ------------- Settings: Sentence templates -------------
-
-const templatesTagFilter = $('#templatesTagFilter');
-const templatesSubTagFilter = $('#templatesSubTagFilter');
-const templatesTableBody = $('#templatesTableBody');
-const templatesPaginationInfo = $('#templatesPaginationInfo');
-const templatesPaginationPage = $('#templatesPaginationPage');
-
-function fillTagFiltersForSettings() {
-  const topLevel = state.tags.filter((t) => t.parent_tag_id == null);
-  const allSub = state.tags.filter((t) => t.parent_tag_id != null);
-
-  templatesTagFilter.innerHTML = '<option value="">Tag (any)</option>';
-  topLevel.forEach((t) => {
-    const opt = createElem('option', null, t.name);
-    opt.value = String(t.id);
-    templatesTagFilter.appendChild(opt);
-  });
-  templatesSubTagFilter.innerHTML = '<option value="">Subtag (any)</option>';
-
-  libraryTagFilter.innerHTML = '<option value="">Tag (any)</option>';
-  librarySubTagFilter.innerHTML = '<option value="">Sub Tag (any)</option>';
-  topLevel.forEach((t) => {
-    const opt = createElem('option', null, t.name);
-    opt.value = String(t.id);
-    libraryTagFilter.appendChild(opt);
-  });
-  // sub-tags for library will be updated on change
-}
-
-templatesTagFilter.addEventListener('change', () => {
-  const parentId = templatesTagFilter.value || null;
-  templatesSubTagFilter.innerHTML = '<option value="">Subtag (any)</option>';
-
-  if (!parentId) return;
-  const children = state.tags.filter(
-    (t) => t.parent_tag_id != null && Number(t.parent_tag_id) === Number(parentId)
-  );
-  children.forEach((t) => {
-    const opt = createElem('option', null, t.name);
-    opt.value = String(t.id);
-    templatesSubTagFilter.appendChild(opt);
-  });
-  state.lists.templates.page = 1;
-  loadTemplatesPage();
-});
-
-templatesSubTagFilter.addEventListener('change', () => {
-  state.lists.templates.page = 1;
-  loadTemplatesPage();
-});
-
-async function loadTemplatesPage() {
-  const listState = state.lists.templates;
-  const page = ensurePositiveInt(listState.page, 1);
-  const pageSize = listState.pageSize;
-
-  const params = new URLSearchParams();
-  params.set('limit', pageSize);
-  params.set('offset', (page - 1) * pageSize);
-
-  const tagId = templatesSubTagFilter.value || templatesTagFilter.value;
-  if (tagId) params.set('tag_id', tagId);
-
-  try {
-    const { data, total } = await apiGet(
-      `/api/sentence-templates?${params.toString()}`
+    CREATE TABLE IF NOT EXISTS sentence_templates (
+      id INTEGER PRIMARY KEY,
+      template_pattern TEXT NOT NULL,
+      description TEXT,
+      is_active INTEGER DEFAULT 1,
+      created_at DATETIME,
+      updated_at DATETIME
     );
-    templatesTableBody.innerHTML = '';
 
-    if (!data || data.length === 0) {
-      const row = createElem('div', 'table__row');
-      const cell = createElem(
-        'div',
-        'table__cell',
-        'No sentence templates for current filters.'
-      );
-      cell.style.gridColumn = '1 / -1';
-      row.appendChild(cell);
-      templatesTableBody.appendChild(row);
-    } else {
-      data.forEach((row) => {
-        const tr = createElem('div', 'table__row');
-        const c0 = createElem('div', 'table__cell');
-        const checkbox = createElem('input');
-        checkbox.type = 'checkbox';
-        checkbox.disabled = true;
-        c0.appendChild(checkbox);
+    CREATE TABLE IF NOT EXISTS template_slots (
+      id INTEGER PRIMARY KEY,
+      template_id INTEGER NOT NULL,
+      slot_name TEXT NOT NULL,
+      grammatical_role TEXT,
+      part_of_speech TEXT,
+      is_required INTEGER DEFAULT 1,
+      order_index INTEGER DEFAULT 0,
+      notes TEXT,
+      FOREIGN KEY(template_id) REFERENCES sentence_templates(id) ON DELETE CASCADE
+    );
 
-        const c1 = createElem('div', 'table__cell', row.template_pattern || '');
-        const c2 = createElem('div', 'table__cell', row.description || '-');
-        const c3 = createElem(
-          'div',
-          'table__cell',
-          row.is_active ? 'Yes' : 'No'
-        );
-        const c4 = createElem('div', 'table__cell', row.updated_at || '-');
+    CREATE TABLE IF NOT EXISTS generated_sentences (
+      id INTEGER PRIMARY KEY,
+      template_id INTEGER,
+      japanese_sentence TEXT NOT NULL,
+      english_sentence TEXT,
+      politeness_level TEXT,
+      jlpt_level TEXT,
+      difficulty TEXT,
+      source_tag_id INTEGER,
+      is_favorite INTEGER DEFAULT 0,
+      created_at DATETIME,
+      FOREIGN KEY(template_id) REFERENCES sentence_templates(id),
+      FOREIGN KEY(source_tag_id) REFERENCES tags(id)
+    );
 
-        tr.appendChild(c0);
-        tr.appendChild(c1);
-        tr.appendChild(c2);
-        tr.appendChild(c3);
-        tr.appendChild(c4);
+    CREATE TABLE IF NOT EXISTS generated_sentence_vocabulary (
+      id INTEGER PRIMARY KEY,
+      generated_sentence_id INTEGER NOT NULL,
+      vocabulary_id INTEGER NOT NULL,
+      slot_name TEXT,
+      created_at DATETIME,
+      FOREIGN KEY(generated_sentence_id) REFERENCES generated_sentences(id) ON DELETE CASCADE,
+      FOREIGN KEY(vocabulary_id) REFERENCES vocabulary(id)
+    );
 
-        templatesTableBody.appendChild(tr);
-      });
-    }
+    CREATE TABLE IF NOT EXISTS practice_history (
+      id INTEGER PRIMARY KEY,
+      generated_sentence_id INTEGER NOT NULL,
+      practiced_at DATETIME,
+      result TEXT,
+      notes TEXT,
+      FOREIGN KEY(generated_sentence_id) REFERENCES generated_sentences(id) ON DELETE CASCADE
+    );
 
-    const totalPages = Math.max(1, Math.ceil(total / pageSize));
-    listState.totalPages = totalPages;
-    listState.page = Math.min(page, totalPages);
+    CREATE TABLE IF NOT EXISTS tags (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      type TEXT,
+      parent_tag_id INTEGER,
+      description TEXT,
+      created_at DATETIME,
+      updated_at DATETIME,
+      FOREIGN KEY(parent_tag_id) REFERENCES tags(id)
+    );
 
-    templatesPaginationInfo.textContent = `Total ${total} template(s) – page size ${pageSize}`;
-    templatesPaginationPage.textContent = `${listState.page} / ${totalPages}`;
-  } catch (err) {
-    console.error(err);
-    templatesPaginationInfo.textContent = 'Error loading templates.';
-  }
+    CREATE TABLE IF NOT EXISTS taggings (
+      id INTEGER PRIMARY KEY,
+      tag_id INTEGER NOT NULL,
+      target_type TEXT NOT NULL, -- 'template', 'generated_sentence', etc.
+      target_id INTEGER NOT NULL,
+      created_at DATETIME,
+      FOREIGN KEY(tag_id) REFERENCES tags(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS tag_vocab_mapping (
+      id INTEGER PRIMARY KEY,
+      tag_id INTEGER NOT NULL,
+      vocab_topic TEXT NOT NULL,
+      vocab_subtopic TEXT,
+      FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+    );
+  `);
 }
 
-$$('.pagination__button[data-tile="sentence-templates"]').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const dir = btn.dataset.dir;
-    const listState = state.lists.templates;
-    if (dir === 'prev') {
-      listState.page = Math.max(1, listState.page - 1);
-    } else if (dir === 'next') {
-      listState.page = Math.min(listState.totalPages, listState.page + 1);
-    }
-    loadTemplatesPage();
-  });
+initSchema();
+
+// --- Express setup ----------------------------------------------------
+
+app.use(express.json());
+
+// Serve frontend
+app.use(express.static(path.join(__dirname, '..', 'web')));
+
+// Helper to parse ints safely
+function toInt(value, fallback) {
+  const n = parseInt(value, 10);
+  return Number.isNaN(n) ? fallback : n;
+}
+
+// --- TAGS -------------------------------------------------------------
+
+// GET /api/tags  → used to populate tag & subtag selects
+app.get('/api/tags', (req, res) => {
+  const rows = db
+    .prepare('SELECT id, name, type, parent_tag_id, description FROM tags ORDER BY name')
+    .all();
+  res.json({ data: rows });
 });
 
-// ------------- Settings: Tags & mapping -------------
+// GET /api/tag-mappings  → list for “Tags & Mapping” tile
+app.get('/api/tag-mappings', (req, res) => {
+  const rows = db
+    .prepare(
+      `
+      SELECT
+        m.id AS mapping_id,
+        t.name AS tag_name,
+        p.name AS parent_tag_name,
+        m.vocab_topic,
+        m.vocab_subtopic,
+        t.description
+      FROM tag_vocab_mapping m
+      JOIN tags t ON t.id = m.tag_id
+      LEFT JOIN tags p ON p.id = t.parent_tag_id
+      ORDER BY t.name
+    `
+    )
+    .all();
+  res.json({ data: rows });
+});
 
-const tagsMappingTableBody = $('#tagsMappingTableBody');
-const tagsMappingPaginationInfo = $('#tagsMappingPaginationInfo');
+// POST /api/tags-with-mapping  → “New” button in Tags tile
+app.post('/api/tags-with-mapping', (req, res) => {
+  const {
+    name,
+    type,
+    parent_tag_id,
+    description,
+    vocab_topic,
+    vocab_subtopic,
+  } = req.body || {};
 
-async function loadTagMappings() {
-  try {
-    const { data } = await apiGet('/api/tag-mappings');
-    tagsMappingTableBody.innerHTML = '';
+  if (!name || !vocab_topic) {
+    return res.status(400).json({ error: 'name and vocab_topic are required' });
+  }
 
-    if (!data || data.length === 0) {
-      const row = createElem('div', 'table__row');
-      const cell = createElem(
-        'div',
-        'table__cell',
-        'No tag mappings defined yet.'
-      );
-      cell.style.gridColumn = '1 / -1';
-      row.appendChild(cell);
-      tagsMappingTableBody.appendChild(row);
-      tagsMappingPaginationInfo.textContent = 'No mappings.';
-      return;
-    }
+  const now = new Date().toISOString();
+  const insertTag = db.prepare(`
+    INSERT INTO tags (name, type, parent_tag_id, description, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
 
-    data.forEach((row) => {
-      const tr = createElem('div', 'table__row');
-      const c0 = createElem('div', 'table__cell');
-      const checkbox = createElem('input');
-      checkbox.type = 'checkbox';
-      checkbox.disabled = true;
-      c0.appendChild(checkbox);
+  const tagResult = insertTag.run(
+    name,
+    type || null,
+    parent_tag_id ? Number(parent_tag_id) : null,
+    description || null,
+    now,
+    now
+  );
 
-      const c1 = createElem('div', 'table__cell', row.tag_name || '');
-      const c2 = createElem(
-        'div',
-        'table__cell',
-        row.parent_tag_name || '-'
-      );
-      const mappedTo = row.vocab_topic
-        ? `${row.vocab_topic} / ${row.vocab_subtopic || 'ALL'}`
-        : '-';
-      const c3 = createElem('div', 'table__cell', mappedTo);
-      const c4 = createElem('div', 'table__cell', row.description || '-');
+  const tagId = tagResult.lastInsertRowid;
 
-      tr.appendChild(c0);
-      tr.appendChild(c1);
-      tr.appendChild(c2);
-      tr.appendChild(c3);
-      tr.appendChild(c4);
-      tagsMappingTableBody.appendChild(tr);
+  db.prepare(
+    `INSERT INTO tag_vocab_mapping (tag_id, vocab_topic, vocab_subtopic)
+     VALUES (?, ?, ?)`
+  ).run(tagId, vocab_topic, vocab_subtopic || null);
+
+  res.json({ tag_id: tagId });
+});
+
+// POST /api/tag-mappings/import  → Import CSV for Tags
+app.post('/api/tag-mappings/import', (req, res) => {
+  const { rows } = req.body || {};
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'rows array required' });
+  }
+
+  const now = new Date().toISOString();
+
+  const tx = db.transaction((rowsToInsert) => {
+    const getTagByName = db.prepare('SELECT * FROM tags WHERE name = ?');
+    const insertTag = db.prepare(`
+      INSERT INTO tags (name, type, parent_tag_id, description, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const getParent = db.prepare('SELECT id FROM tags WHERE name = ?');
+    const insertMapping = db.prepare(`
+      INSERT INTO tag_vocab_mapping (tag_id, vocab_topic, vocab_subtopic)
+      VALUES (?, ?, ?)
+    `);
+
+    rowsToInsert.forEach((r) => {
+      const tagName = r.tag_name || r.name;
+      if (!tagName || !r.vocab_topic) return;
+
+      let parentId = null;
+      if (r.parent_tag_name) {
+        const p = getParent.get(r.parent_tag_name);
+        if (p) parentId = p.id;
+      }
+
+      let tag = getTagByName.get(tagName);
+      if (!tag) {
+        const resTag = insertTag.run(
+          tagName,
+          r.type || null,
+          parentId,
+          r.description || null,
+          now,
+          now
+        );
+        tag = { id: resTag.lastInsertRowid };
+      }
+
+      insertMapping.run(tag.id, r.vocab_topic, r.vocab_subtopic || null);
     });
+  });
 
-    tagsMappingPaginationInfo.textContent = `Loaded ${data.length} mapping(s).`;
-  } catch (err) {
-    console.error(err);
-    tagsMappingPaginationInfo.textContent = 'Error loading mappings.';
+  tx(rows);
+
+  res.json({ inserted: rows.length });
+});
+
+// POST /api/tag-mappings/delete-bulk
+app.post('/api/tag-mappings/delete-bulk', (req, res) => {
+  const { ids } = req.body || {};
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'ids array required' });
   }
-}
-
-// ------------- Settings: Sentence library -------------
-
-const libraryTagFilter = $('#libraryTagFilter');
-const librarySubTagFilter = $('#librarySubTagFilter');
-const libraryPolitenessFilter = $('#libraryPolitenessFilter');
-const libraryDifficultyFilter = $('#libraryDifficultyFilter');
-const sentenceLibraryTableBody = $('#sentenceLibraryTableBody');
-const libraryPaginationInfo = $('#libraryPaginationInfo');
-const libraryPaginationPage = $('#libraryPaginationPage');
-
-libraryTagFilter.addEventListener('change', () => {
-  const parentId = libraryTagFilter.value || null;
-  librarySubTagFilter.innerHTML = '<option value="">Sub Tag (any)</option>';
-
-  if (!parentId) {
-    loadSentenceLibraryPage(1);
-    return;
-  }
-
-  const children = state.tags.filter(
-    (t) => t.parent_tag_id != null && Number(t.parent_tag_id) === Number(parentId)
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`DELETE FROM tag_vocab_mapping WHERE id IN (${placeholders})`).run(
+    ...ids
   );
-  children.forEach((t) => {
-    const opt = createElem('option', null, t.name);
-    opt.value = String(t.id);
-    librarySubTagFilter.appendChild(opt);
-  });
-
-  loadSentenceLibraryPage(1);
+  res.json({ deleted: ids.length });
 });
 
-[
-  librarySubTagFilter,
-  libraryPolitenessFilter,
-  libraryDifficultyFilter,
-].forEach((el) =>
-  el.addEventListener('change', () => loadSentenceLibraryPage(1))
-);
+// --- VOCABULARY -------------------------------------------------------
 
-async function loadSentenceLibraryPage(page) {
-  const listState = state.lists.sentenceLibrary;
-  listState.page = ensurePositiveInt(page, 1);
-  const pageSize = listState.pageSize;
+// GET /api/vocabulary?limit=&offset=&topic=&subtopic=&politeness=&jlpt=&difficulty=
+app.get('/api/vocabulary', (req, res) => {
+  const limit = toInt(req.query.limit, 20);
+  const offset = toInt(req.query.offset, 0);
 
-  const params = new URLSearchParams();
-  params.set('limit', pageSize);
-  params.set('offset', (listState.page - 1) * pageSize);
+  const where = [];
+  const params = [];
 
-  const tagId = librarySubTagFilter.value || libraryTagFilter.value;
-  if (tagId) params.set('tag_id', tagId);
-  if (libraryPolitenessFilter.value)
-    params.set('politeness', libraryPolitenessFilter.value);
-  if (libraryDifficultyFilter.value)
-    params.set('difficulty', libraryDifficultyFilter.value);
-
-  try {
-    const { data, total } = await apiGet(
-      `/api/generated-sentences?${params.toString()}`
-    );
-    sentenceLibraryTableBody.innerHTML = '';
-
-    if (!data || data.length === 0) {
-      const row = createElem('div', 'table__row');
-      const cell = createElem(
-        'div',
-        'table__cell',
-        'No generated sentences yet for these filters.'
-      );
-      cell.style.gridColumn = '1 / -1';
-      row.appendChild(cell);
-      sentenceLibraryTableBody.appendChild(row);
-    } else {
-      data.forEach((row) => {
-        const tr = createElem('div', 'table__row');
-        const c0 = createElem('div', 'table__cell');
-        const checkbox = createElem('input');
-        checkbox.type = 'checkbox';
-        checkbox.disabled = true;
-        c0.appendChild(checkbox);
-
-        const c1 = createElem(
-          'div',
-          'table__cell',
-          row.japanese_sentence || ''
-        );
-        const c2 = createElem('div', 'table__cell', row.tag_name || '-');
-        const c3 = createElem(
-          'div',
-          'table__cell',
-          row.politeness_level || '-'
-        );
-        const c4 = createElem('div', 'table__cell', row.difficulty || '-');
-        const c5 = createElem(
-          'div',
-          'table__cell',
-          row.is_favorite ? '❤️' : '♡'
-        );
-
-        tr.appendChild(c0);
-        tr.appendChild(c1);
-        tr.appendChild(c2);
-        tr.appendChild(c3);
-        tr.appendChild(c4);
-        tr.appendChild(c5);
-
-        sentenceLibraryTableBody.appendChild(tr);
-      });
-    }
-
-    const totalPages = Math.max(1, Math.ceil(total / pageSize));
-    listState.totalPages = totalPages;
-    listState.page = Math.min(listState.page, totalPages);
-
-    libraryPaginationInfo.textContent = `Total ${total} sentence(s) – page size ${pageSize}`;
-    libraryPaginationPage.textContent = `${listState.page} / ${totalPages}`;
-  } catch (err) {
-    console.error(err);
-    libraryPaginationInfo.textContent = 'Error loading sentence library.';
+  if (req.query.topic) {
+    where.push('topic = ?');
+    params.push(req.query.topic);
   }
-}
+  if (req.query.subtopic) {
+    where.push('subtopic = ?');
+    params.push(req.query.subtopic);
+  }
+  if (req.query.politeness) {
+    where.push('politeness_level = ?');
+    params.push(req.query.politeness);
+  }
+  if (req.query.jlpt) {
+    where.push('jlpt_level = ?');
+    params.push(req.query.jlpt);
+  }
+  if (req.query.difficulty) {
+    where.push('difficulty = ?');
+    params.push(req.query.difficulty);
+  }
 
-$$('.pagination__button[data-tile="sentence-library"]').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const dir = btn.dataset.dir;
-    const listState = state.lists.sentenceLibrary;
-    if (dir === 'prev') {
-      listState.page = Math.max(1, listState.page - 1);
-    } else if (dir === 'next') {
-      listState.page = Math.min(listState.totalPages, listState.page + 1);
-    }
-    loadSentenceLibraryPage(listState.page);
-  });
+  const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+
+  const total = db
+    .prepare(`SELECT COUNT(*) AS c FROM vocabulary ${whereSql}`)
+    .get(...params).c;
+
+  const data = db
+    .prepare(
+      `SELECT * FROM vocabulary ${whereSql}
+       ORDER BY updated_at DESC, id DESC
+       LIMIT ? OFFSET ?`
+    )
+    .all(...params, limit, offset);
+
+  res.json({ data, total });
 });
 
-// ------------- Settings: Slots viewer (simple) -------------
-
-const slotsTableBody = $('#slotsTableBody');
-
-async function loadSlotsForCurrentTemplatesSample() {
-  slotsTableBody.innerHTML = '';
-
-  // Simple heuristic: load slots for first templates page (already loaded)
-  try {
-    const firstTemplatesRes = await apiGet(
-      `/api/sentence-templates?limit=5&offset=0`
-    );
-    const templates = firstTemplatesRes.data || [];
-    if (templates.length === 0) {
-      const row = createElem('div', 'table__row');
-      const cell = createElem(
-        'div',
-        'table__cell',
-        'No templates yet → no slots.'
-      );
-      cell.style.gridColumn = '1 / -1';
-      row.appendChild(cell);
-      slotsTableBody.appendChild(row);
-      return;
-    }
-
-    for (const tmpl of templates) {
-      const { data: slots } = await apiGet(
-        `/api/template-slots?template_id=${tmpl.id}`
-      );
-      slots.forEach((slot) => {
-        const tr = createElem('div', 'table__row');
-        const c0 = createElem('div', 'table__cell');
-        const checkbox = createElem('input');
-        checkbox.type = 'checkbox';
-        checkbox.disabled = true;
-        c0.appendChild(checkbox);
-
-        const c1 = createElem('div', 'table__cell', slot.slot_name || '');
-        const c2 = createElem(
-          'div',
-          'table__cell',
-          slot.grammatical_role || '-'
-        );
-        const c3 = createElem(
-          'div',
-          'table__cell',
-          slot.part_of_speech || '-'
-        );
-        const c4 = createElem(
-          'div',
-          'table__cell',
-          tmpl.template_pattern || ''
-        );
-
-        tr.appendChild(c0);
-        tr.appendChild(c1);
-        tr.appendChild(c2);
-        tr.appendChild(c3);
-        tr.appendChild(c4);
-        slotsTableBody.appendChild(tr);
-      });
-    }
-  } catch (err) {
-    console.error(err);
-    const row = createElem('div', 'table__row');
-    const cell = createElem('div', 'table__cell', 'Error loading slots.');
-    cell.style.gridColumn = '1 / -1';
-    row.appendChild(cell);
-    slotsTableBody.appendChild(row);
+// POST /api/vocabulary → “New” vocab entry
+app.post('/api/vocabulary', (req, res) => {
+  const body = req.body || {};
+  if (!body.furigana && !body.kanji && !body.romaji && !body.meaning) {
+    return res.status(400).json({ error: 'At least one of furigana/kanji/romaji/meaning required' });
   }
-}
+  const now = new Date().toISOString();
 
-// ------------- Settings: One-time loader -------------
+  const stmt = db.prepare(`
+    INSERT INTO vocabulary (
+      kanji, furigana, romaji, meaning,
+      part_of_speech, topic, subtopic,
+      politeness_level, jlpt_level, difficulty,
+      notes, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
-async function loadSettingsDataOnce() {
-  if (settingsLoaded) return;
-  settingsLoaded = true;
-
-  // Fill tag-based filters
-  fillTagFiltersForSettings();
-
-  // Load vocabulary, templates, mappings, sentence library, slots
-  await Promise.all([
-    loadVocabularyPage(),
-    loadTemplatesPage(),
-    loadTagMappings(),
-    loadSentenceLibraryPage(1),
-    loadSlotsForCurrentTemplatesSample(),
-  ]);
-}
-
-// ------------- Full-tile logic for open-in-new-tab -------------
-
-(function handleFullTileMode() {
-  const params = new URLSearchParams(window.location.search);
-  const fullTile = params.get('fullTile');
-  if (!fullTile) return;
-
-  sections.forEach((section) => {
-    section.classList.toggle('hidden', section.id !== 'settings');
-  });
-  navItems.forEach((link) =>
-    link.classList.toggle('active', link.dataset.target === 'settings')
+  const result = stmt.run(
+    body.kanji || null,
+    body.furigana || null,
+    body.romaji || null,
+    body.meaning || null,
+    body.part_of_speech || null,
+    body.topic || null,
+    body.subtopic || null,
+    body.politeness_level || null,
+    body.jlpt_level || null,
+    body.difficulty || null,
+    body.notes || null,
+    now,
+    now
   );
 
-  $$('.tile').forEach((tile) => {
-    if (tile.id && tile.id !== fullTile) {
-      tile.classList.add('hidden');
-    } else if (tile.id === fullTile) {
-      tile.classList.add('tile--full');
-      const pagination = tile.querySelector('.pagination');
-      if (pagination) pagination.classList.add('hidden');
-    }
-  });
-
-  // Ensure settings data is loaded in the new tab
-  loadSettingsDataOnce();
-})();
-
-// ------------- Init on load -------------
-
-window.addEventListener('DOMContentLoaded', async () => {
-  await loadTags();
-  renderSentenceTokens(null); // initial empty sentence display
+  res.json({ id: result.lastInsertRowid });
 });
 
+// POST /api/vocabulary/import  → CSV import
+app.post('/api/vocabulary/import', (req, res) => {
+  const { rows } = req.body || {};
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'rows array required' });
+  }
+
+  const now = new Date().toISOString();
+  const stmt = db.prepare(`
+    INSERT INTO vocabulary (
+      kanji, furigana, romaji, meaning,
+      part_of_speech, topic, subtopic,
+      politeness_level, jlpt_level, difficulty,
+      notes, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const tx = db.transaction((rowsToInsert) => {
+    rowsToInsert.forEach((r) => {
+      stmt.run(
+        r.kanji || null,
+        r.furigana || null,
+        r.romaji || null,
+        r.meaning || null,
+        r.part_of_speech || null,
+        r.topic || null,
+        r.subtopic || null,
+        r.politeness_level || null,
+        r.jlpt_level || null,
+        r.difficulty || null,
+        r.notes || null,
+        now,
+        now
+      );
+    });
+  });
+
+  tx(rows);
+  res.json({ inserted: rows.length });
+});
+
+// POST /api/vocabulary/delete-bulk
+app.post('/api/vocabulary/delete-bulk', (req, res) => {
+  const { ids } = req.body || {};
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'ids array required' });
+  }
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`DELETE FROM vocabulary WHERE id IN (${placeholders})`).run(
+    ...ids
+  );
+  res.json({ deleted: ids.length });
+});
+
+// --- SENTENCE TEMPLATES & SLOTS --------------------------------------
+
+// GET /api/sentence-templates?limit=&offset=&tag_id=
+app.get('/api/sentence-templates', (req, res) => {
+  const limit = toInt(req.query.limit, 20);
+  const offset = toInt(req.query.offset, 0);
+  const tagId = req.query.tag_id ? Number(req.query.tag_id) : null;
+
+  let whereSql = '';
+  let joinSql = '';
+  const params = [];
+
+  if (tagId) {
+    joinSql =
+      'JOIN taggings tg ON tg.target_type = "template" AND tg.target_id = st.id';
+    whereSql = 'WHERE tg.tag_id = ?';
+    params.push(tagId);
+  }
+
+  const totalRow = db
+    .prepare(
+      `SELECT COUNT(DISTINCT st.id) AS c
+       FROM sentence_templates st
+       ${joinSql} ${whereSql}`
+    )
+    .get(...params);
+
+  const data = db
+    .prepare(
+      `SELECT DISTINCT st.*
+       FROM sentence_templates st
+       ${joinSql} ${whereSql}
+       ORDER BY st.updated_at DESC, st.id DESC
+       LIMIT ? OFFSET ?`
+    )
+    .all(...params, limit, offset);
+
+  res.json({ data, total: totalRow.c });
+});
+
+// POST /api/sentence-templates
+app.post('/api/sentence-templates', (req, res) => {
+  const body = req.body || {};
+  if (!body.template_pattern) {
+    return res.status(400).json({ error: 'template_pattern is required' });
+  }
+  const now = new Date().toISOString();
+  const isActive =
+    body.is_active === true ||
+    body.is_active === 'true' ||
+    body.is_active === 'on' ||
+    body.is_active === 1 ||
+    body.is_active === '1'
+      ? 1
+      : 0;
+
+  const stmt = db.prepare(`
+    INSERT INTO sentence_templates (template_pattern, description, is_active, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const result = stmt.run(
+    body.template_pattern,
+    body.description || null,
+    isActive,
+    now,
+    now
+  );
+  res.json({ id: result.lastInsertRowid });
+});
+
+// POST /api/sentence-templates/import
+app.post('/api/sentence-templates/import', (req, res) => {
+  const { rows } = req.body || {};
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'rows array required' });
+  }
+  const now = new Date().toISOString();
+  const stmt = db.prepare(`
+    INSERT INTO sentence_templates (template_pattern, description, is_active, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const tx = db.transaction((rowsToInsert) => {
+    rowsToInsert.forEach((r) => {
+      if (!r.template_pattern) return;
+      const isActive =
+        r.is_active === true ||
+        r.is_active === 'true' ||
+        r.is_active === '1' ||
+        r.is_active === 1
+          ? 1
+          : 0;
+      stmt.run(
+        r.template_pattern,
+        r.description || null,
+        isActive,
+        now,
+        now
+      );
+    });
+  });
+
+  tx(rows);
+  res.json({ inserted: rows.length });
+});
+
+// POST /api/sentence-templates/delete-bulk
+app.post('/api/sentence-templates/delete-bulk', (req, res) => {
+  const { ids } = req.body || {};
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'ids array required' });
+  }
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`DELETE FROM sentence_templates WHERE id IN (${placeholders})`).run(
+    ...ids
+  );
+  res.json({ deleted: ids.length });
+});
+
+// GET /api/template-slots?template_id=
+app.get('/api/template-slots', (req, res) => {
+  const templateId = Number(req.query.template_id);
+  if (!templateId) {
+    return res.status(400).json({ error: 'template_id required' });
+  }
+  const data = db
+    .prepare(
+      `SELECT * FROM template_slots
+       WHERE template_id = ?
+       ORDER BY order_index ASC, id ASC`
+    )
+    .all(templateId);
+  res.json({ data });
+});
+
+// POST /api/template-slots
+app.post('/api/template-slots', (req, res) => {
+  const body = req.body || {};
+  if (!body.template_id || !body.slot_name) {
+    return res
+      .status(400)
+      .json({ error: 'template_id and slot_name are required' });
+  }
+
+  const isRequired =
+    body.is_required === true ||
+    body.is_required === 'true' ||
+    body.is_required === 'on' ||
+    body.is_required === 1 ||
+    body.is_required === '1'
+      ? 1
+      : 0;
+
+  const orderIndex = body.order_index ? Number(body.order_index) : 0;
+
+  const stmt = db.prepare(`
+    INSERT INTO template_slots (
+      template_id, slot_name, grammatical_role, part_of_speech,
+      is_required, order_index, notes
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const result = stmt.run(
+    Number(body.template_id),
+    body.slot_name,
+    body.grammatical_role || null,
+    body.part_of_speech || null,
+    isRequired,
+    orderIndex,
+    body.notes || null
+  );
+
+  res.json({ id: result.lastInsertRowid });
+});
+
+// POST /api/template-slots/import
+app.post('/api/template-slots/import', (req, res) => {
+  const { rows } = req.body || {};
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'rows array required' });
+  }
+
+  const stmt = db.prepare(`
+    INSERT INTO template_slots (
+      template_id, slot_name, grammatical_role, part_of_speech,
+      is_required, order_index, notes
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const tx = db.transaction((rowsToInsert) => {
+    rowsToInsert.forEach((r) => {
+      if (!r.template_id || !r.slot_name) return;
+      const isRequired =
+        r.is_required === true ||
+        r.is_required === 'true' ||
+        r.is_required === '1' ||
+        r.is_required === 1
+          ? 1
+          : 0;
+      const orderIndex = r.order_index ? Number(r.order_index) : 0;
+
+      stmt.run(
+        Number(r.template_id),
+        r.slot_name,
+        r.grammatical_role || null,
+        r.part_of_speech || null,
+        isRequired,
+        orderIndex,
+        r.notes || null
+      );
+    });
+  });
+
+  tx(rows);
+  res.json({ inserted: rows.length });
+});
+
+// POST /api/template-slots/delete-bulk
+app.post('/api/template-slots/delete-bulk', (req, res) => {
+  const { ids } = req.body || {};
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'ids array required' });
+  }
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`DELETE FROM template_slots WHERE id IN (${placeholders})`).run(
+    ...ids
+  );
+  res.json({ deleted: ids.length });
+});
+
+// --- SENTENCE LIBRARY (generated_sentences) ---------------------------
+
+// GET /api/generated-sentences?limit=&offset=&tag_id=&politeness=&difficulty=
+app.get('/api/generated-sentences', (req, res) => {
+  const limit = toInt(req.query.limit, 20);
+  const offset = toInt(req.query.offset, 0);
+
+  const where = [];
+  const params = [];
+
+  if (req.query.tag_id) {
+    where.push('gs.source_tag_id = ?');
+    params.push(Number(req.query.tag_id));
+  }
+  if (req.query.politeness) {
+    where.push('gs.politeness_level = ?');
+    params.push(req.query.politeness);
+  }
+  if (req.query.difficulty) {
+    where.push('gs.difficulty = ?');
+    params.push(req.query.difficulty);
+  }
+
+  const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+
+  const total = db
+    .prepare(
+      `SELECT COUNT(*) AS c
+       FROM generated_sentences gs
+       ${whereSql}`
+    )
+    .get(...params).c;
+
+  const data = db
+    .prepare(
+      `SELECT
+         gs.*,
+         t.name AS tag_name
+       FROM generated_sentences gs
+       LEFT JOIN tags t ON t.id = gs.source_tag_id
+       ${whereSql}
+       ORDER BY gs.created_at DESC, gs.id DESC
+       LIMIT ? OFFSET ?`
+    )
+    .all(...params, limit, offset);
+
+  res.json({ data, total });
+});
+
+// POST /api/generated-sentences  → “New” in Sentence Library tile
+app.post('/api/generated-sentences', (req, res) => {
+  const body = req.body || {};
+  if (!body.japanese_sentence) {
+    return res.status(400).json({ error: 'japanese_sentence is required' });
+  }
+  const now = new Date().toISOString();
+  const isFavorite =
+    body.is_favorite === true ||
+    body.is_favorite === 'true' ||
+    body.is_favorite === 'on' ||
+    body.is_favorite === 1 ||
+    body.is_favorite === '1'
+      ? 1
+      : 0;
+
+  const stmt = db.prepare(`
+    INSERT INTO generated_sentences (
+      template_id, japanese_sentence, english_sentence,
+      politeness_level, jlpt_level, difficulty,
+      source_tag_id, is_favorite, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const result = stmt.run(
+    body.template_id ? Number(body.template_id) : null,
+    body.japanese_sentence,
+    body.english_sentence || null,
+    body.politeness_level || null,
+    body.jlpt_level || null,
+    body.difficulty || null,
+    body.source_tag_id ? Number(body.source_tag_id) : null,
+    isFavorite,
+    now
+  );
+
+  res.json({ id: result.lastInsertRowid });
+});
+
+// POST /api/generated-sentences/import
+app.post('/api/generated-sentences/import', (req, res) => {
+  const { rows } = req.body || {};
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'rows array required' });
+  }
+
+  const now = new Date().toISOString();
+
+  const getTagByName = db.prepare('SELECT id FROM tags WHERE name = ?');
+
+  const stmt = db.prepare(`
+    INSERT INTO generated_sentences (
+      template_id, japanese_sentence, english_sentence,
+      politeness_level, jlpt_level, difficulty,
+      source_tag_id, is_favorite, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const tx = db.transaction((rowsToInsert) => {
+    rowsToInsert.forEach((r) => {
+      if (!r.japanese_sentence) return;
+
+      let tagId = null;
+      if (r.source_tag_id) {
+        tagId = Number(r.source_tag_id);
+      } else if (r.tag_name) {
+        const row = getTagByName.get(r.tag_name);
+        if (row) tagId = row.id;
+      }
+
+      const isFavorite =
+        r.is_favorite === true ||
+        r.is_favorite === 'true' ||
+        r.is_favorite === '1' ||
+        r.is_favorite === 1
+          ? 1
+          : 0;
+
+      stmt.run(
+        r.template_id ? Number(r.template_id) : null,
+        r.japanese_sentence,
+        r.english_sentence || null,
+        r.politeness_level || null,
+        r.jlpt_level || null,
+        r.difficulty || null,
+        tagId,
+        isFavorite,
+        now
+      );
+    });
+  });
+
+  tx(rows);
+  res.json({ inserted: rows.length });
+});
+
+// POST /api/generated-sentences/delete-bulk
+app.post('/api/generated-sentences/delete-bulk', (req, res) => {
+  const { ids } = req.body || {};
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'ids array required' });
+  }
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`DELETE FROM generated_sentences WHERE id IN (${placeholders})`).run(
+    ...ids
+  );
+  res.json({ deleted: ids.length });
+});
+
+// POST /api/generated-sentences/:id/favorite
+app.post('/api/generated-sentences/:id/favorite', (req, res) => {
+  const id = Number(req.params.id);
+  const { isFavorite } = req.body || {};
+  const fav =
+    isFavorite === true ||
+    isFavorite === 'true' ||
+    isFavorite === 1 ||
+    isFavorite === '1'
+      ? 1
+      : 0;
+
+  db.prepare(
+    'UPDATE generated_sentences SET is_favorite = ? WHERE id = ?'
+  ).run(fav, id);
+
+  res.json({ id, is_favorite: fav });
+});
+
+// --- SENTENCE GENERATOR -----------------------------------------------
+
+// POST /api/generate
+// Body: { tagId, difficulty, jlptLevel, politenessLevel, displayField }
+app.post('/api/generate', (req, res) => {
+  const {
+    tagId,
+    difficulty,
+    jlptLevel,
+    politenessLevel,
+    displayField = 'furigana',
+  } = req.body || {};
+
+  if (!tagId) {
+    return res.status(400).json({ error: 'tagId is required' });
+  }
+
+  // 1) pick active templates for this tag
+  const templates = db
+    .prepare(
+      `
+      SELECT st.*
+      FROM sentence_templates st
+      JOIN taggings tg
+        ON tg.target_type = 'template'
+       AND tg.target_id = st.id
+      WHERE tg.tag_id = ?
+        AND st.is_active = 1
+    `
+    )
+    .all(Number(tagId));
+
+  if (!templates.length) {
+    return res
+      .status(400)
+      .json({ error: 'No active templates mapped to this tag yet.' });
+  }
+
+  const template =
+    templates[Math.floor(Math.random() * templates.length)];
+
+  // 2) slots for the template
+  const slots = db
+    .prepare(
+      `SELECT * FROM template_slots
+       WHERE template_id = ?
+       ORDER BY order_index ASC, id ASC`
+    )
+    .all(template.id);
+
+  if (!slots.length) {
+    return res
+      .status(400)
+      .json({ error: 'Selected template has no slots defined.' });
+  }
+
+  // 3) tag → vocab_topic/subtopic mappings
+  const mappings = db
+    .prepare(
+      `SELECT vocab_topic, vocab_subtopic
+       FROM tag_vocab_mapping
+       WHERE tag_id = ?`
+    )
+    .all(Number(tagId));
+
+  // helper to pick 1 vocab row for a slot
+  function pickVocabForSlot(slot) {
+    const where = ['part_of_speech = ?'];
+    const params = [slot.part_of_speech || 'noun']; // default if missing
+
+    if (difficulty) {
+      where.push('(difficulty = ?)');
+      params.push(difficulty);
+    }
+    if (jlptLevel) {
+      where.push('(jlpt_level = ?)');
+      params.push(jlptLevel);
+    }
+    if (politenessLevel) {
+      where.push('(politeness_level = ?)');
+      params.push(politenessLevel);
+    }
+
+    if (mappings.length) {
+      const topicClauses = [];
+      mappings.forEach((m) => {
+        if (!m.vocab_topic) return;
+        if (m.vocab_subtopic) {
+          topicClauses.push('(topic = ? AND subtopic = ?)');
+          params.push(m.vocab_topic, m.vocab_subtopic);
+        } else {
+          topicClauses.push('(topic = ?)');
+          params.push(m.vocab_topic);
+        }
+      });
+      if (topicClauses.length) {
+        where.push('(' + topicClauses.join(' OR ') + ')');
+      }
+    }
+
+    const sql =
+      'SELECT * FROM vocabulary WHERE ' +
+      where.join(' AND ') +
+      ' ORDER BY RANDOM() LIMIT 1';
+
+    const row = db.prepare(sql).get(...params);
+    return row || null;
+  }
+
+  const chosen = {};
+  const vocabRows = [];
+
+  for (const slot of slots) {
+    const v = pickVocabForSlot(slot);
+    if (!v) {
+      return res.status(400).json({
+        error: `No vocabulary found for slot "${slot.slot_name}" (check topic/subtopic and filters).`,
+      });
+    }
+    chosen[slot.slot_name] = v;
+    vocabRows.push({ slot_name: slot.slot_name, row: v });
+  }
+
+  // 4) build final sentence string
+  let sentence = template.template_pattern;
+  Object.entries(chosen).forEach(([slotName, v]) => {
+    const value =
+      v[displayField] || v.kanji || v.romaji || v.furigana || v.meaning;
+    const re = new RegExp(`{${slotName}}`, 'g');
+    sentence = sentence.replace(re, value || '');
+  });
+
+  const tokens = sentence
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((t) => ({ display: t }));
+
+  // 5) compute overall difficulty / jlpt (very naive)
+  const sentenceDifficulty =
+    difficulty ||
+    (vocabRows.some((x) => x.row.difficulty === 'Advanced')
+      ? 'Advanced'
+      : vocabRows.some((x) => x.row.difficulty === 'Intermediate')
+      ? 'Intermediate'
+      : vocabRows.some((x) => x.row.difficulty === 'Beginner')
+      ? 'Beginner'
+      : null);
+
+  const sentenceJlpt =
+    jlptLevel ||
+    (vocabRows.reduce((acc, x) => acc || x.row.jlpt_level, null) || null);
+
+  const sentencePoliteness =
+    politenessLevel ||
+    (vocabRows.reduce((acc, x) => acc || x.row.politeness_level, null) ||
+      null);
+
+  const now = new Date().toISOString();
+
+  const insertSentence = db.prepare(`
+    INSERT INTO generated_sentences (
+      template_id, japanese_sentence, english_sentence,
+      politeness_level, jlpt_level, difficulty,
+      source_tag_id, is_favorite, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+  `);
+
+  const result = insertSentence.run(
+    template.id,
+    sentence,
+    null,
+    sentencePoliteness,
+    sentenceJlpt,
+    sentenceDifficulty,
+    Number(tagId),
+    now
+  );
+
+  const generatedId = result.lastInsertRowid;
+
+  const insertGsv = db.prepare(`
+    INSERT INTO generated_sentence_vocabulary (
+      generated_sentence_id, vocabulary_id, slot_name, created_at
+    )
+    VALUES (?, ?, ?, ?)
+  `);
+
+  vocabRows.forEach((v) => {
+    insertGsv.run(generatedId, v.row.id, v.slot_name, now);
+  });
+
+  res.json({
+    id: generatedId,
+    templateId: template.id,
+    japaneseSentence: sentence,
+    englishSentence: null,
+    politeness_level: sentencePoliteness,
+    jlpt_level: sentenceJlpt,
+    difficulty: sentenceDifficulty,
+    source_tag_id: Number(tagId),
+    tokens,
+  });
+});
+
+// --- Fallback: serve index.html for root ------------------------------
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'web', 'index.html'));
+});
+
+// --- Start server -----------------------------------------------------
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`SentenceLab server listening on http://localhost:${PORT}`);
+});
